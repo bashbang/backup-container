@@ -43,19 +43,19 @@ ls docker/ | grep 'backup\.' | awk '{ print "- ./docker/"$1":/"$1 }'
 
 ## Smoke test
 
-The project includes a smoke test that validates a real backup/restore flow.
+The project includes a smoke test that validates a real backup/restore flow against the configured database backends.
 
 What it does:
 
-1. Ensures the source database exists.
+1. Ensures the source database exists for the selected backend.
 2. Loads a Sakila schema/data set if it is not already present.
 3. Runs the backup command to produce a `.sql.gz` archive.
 4. Locates the newest backup.
 5. Restores that backup into a second database (`sakila_restore`).
-6. Exports each table from both databases to CSV with a stable row ordering.
-7. Compares the CSV output and exits non-zero on any mismatch.
+6. Exports each table from both databases to a stable, ordered snapshot.
+7. Compares the snapshot and exits non-zero on any mismatch.
 
-This is the working validation strategy for the smoke test: compare the actual table data from the source and restored databases rather than comparing raw `pg_dump` output, which includes version-specific metadata and can differ even when the underlying data matches.
+This is the working validation strategy for the smoke test: compare the actual table data from the source and restored databases rather than comparing raw dump output, which may include engine-specific metadata and can differ even when the underlying data matches.
 
 Run the smoke test after the stack is up:
 
@@ -64,14 +64,20 @@ docker compose up -d --build
 bash scripts/smoke-test.sh
 ```
 
-The script prints progress as it creates the database, loads Sakila data, runs the backup, restores the archive, and compares the table contents. If it passes, the final output includes:
+The default matrix is both PostgreSQL and MySQL in a single run. You can limit it explicitly:
 
-```text
-All restored tables match the original source data.
-Smoke test passed.
+```bash
+DB_TYPES=postgres bash scripts/smoke-test.sh
+DB_TYPES=mysql bash scripts/smoke-test.sh
 ```
 
-On a typical local development machine, the smoke test completes in roughly 20-30 seconds once the Docker stack is already running.
+The script prints progress as it creates the database, loads Sakila data, runs the backup, restores the archive, and compares the table contents. If all backends pass, the final output includes a per-backend status line and:
+
+```text
+Overall result: PASS
+```
+
+On a typical local development machine, the combined smoke test completes in roughly 30-60 seconds once the Docker stack is already running.
 
 ## Postgres
 
