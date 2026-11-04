@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Smoke test for the local backup workflow.
 #
-# This script validates the end-to-end backup path used by the project:
-#   1. ensure a source database exists
-#   2. load Sakila sample data if it is missing
-#   3. create a backup archive
-#   4. restore the newest backup into a second database
-#   5. compare each restored table against the source data
+# This script validates the end-to-end backup/restore behavior for the project's
+# real database plugins and library functions. It is intentionally not a
+# self-contained database bootstrapper: the source database is expected to exist
+# and already contain the data you want to protect.
+#
+# The smoke test flow is:
+#   1. confirm the source database is already available
+#   2. create a backup archive
+#   3. restore the newest backup into a second database
+#   4. compare each restored table against the source data
 #
 # The comparison is intentionally done against the actual table rows, exported as
 # a stable snapshot, rather than comparing raw dump output that can contain
@@ -17,12 +21,21 @@
 #   DB_TYPE=mysql bash scripts/smoke-test.sh
 #
 # Environment overrides:
-#   COMPOSE_CMD     default: docker compose
-#   RETRY_COUNT     default: 30
-#   SLEEP_SECONDS   default: 2
-#   DB_TYPE         default: postgres
-#   DB_TYPES        default: postgres,mysql
-#   SAKILA_DB_COMMIT default: pinned upstream Sakila commit
+#   COMPOSE_CMD                  default: docker compose
+#   RETRY_COUNT                  default: 30
+#   SLEEP_SECONDS                default: 2
+#   DB_TYPE                      default: postgres
+#   DB_TYPES                     default: postgres,mysql
+#   SOURCE_DB_NAME               default: sakila
+#   RESTORE_DB_NAME              default: sakila_restore
+#   SMOKE_TEST_BOOTSTRAP_DB      default: 0
+#   SMOKE_TEST_BOOTSTRAP_SAKILA  default: 0
+#
+# The smoke test is designed to validate a database plugin against a real source
+# database. The default path expects the source database to already exist in the
+# environment under test. The bootstrap variables below are purely a local
+# convenience for isolated validation runs and are not part of the normal plugin
+# contract.
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -38,8 +51,11 @@ else
   DB_TYPE="postgres"
   DB_TYPES="${DB_TYPES:-postgres,mysql}"
 fi
-DB_NAME="sakila"
-RESTORE_DB_NAME="sakila_restore"
+SOURCE_DB_NAME="${SOURCE_DB_NAME:-${DB_NAME:-sakila}}"
+DB_NAME="${SOURCE_DB_NAME}"
+RESTORE_DB_NAME="${RESTORE_DB_NAME:-sakila_restore}"
+SMOKE_TEST_BOOTSTRAP_DB="${SMOKE_TEST_BOOTSTRAP_DB:-0}"
+SMOKE_TEST_BOOTSTRAP_SAKILA="${SMOKE_TEST_BOOTSTRAP_SAKILA:-0}"
 
 DB_SERVICE_NAME_OVERRIDE="${DB_SERVICE_NAME:-}"
 BACKUP_SERVICE_NAME_OVERRIDE="${BACKUP_SERVICE_NAME:-}"
@@ -63,12 +79,6 @@ apply_backend_settings
 DB_PASSWORD="${DB_PASSWORD:-secret}"
 DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-secret}"
 
-# Pin the Sakila scripts to a known-good upstream commit so the smoke test stays
-# deterministic while still allowing a single-variable update when a new version
-# is qualified.
-SAKILA_DB_COMMIT="${SAKILA_DB_COMMIT:-e089a5b1ec9af0df7a9c6a5d47d49fa1736a4e84}"
-SAKILA_DB_BASE_URL="https://raw.githubusercontent.com/jOOQ/sakila/${SAKILA_DB_COMMIT}"
-
 GREEN="\033[32m"
 RED="\033[31m"
 RESET="\033[0m"
@@ -83,6 +93,25 @@ print_green() {
 
 print_red() {
   printf '%b\n' "${RED}${1}${RESET}" >&2
+}
+
+print_backend_banner() {
+  local backend="${1}"
+  local color="\033[1;33m"
+
+  if [[ "${backend}" == "mysql" ]]; then
+    color="\033[1;35m"
+  elif [[ "${backend}" == "postgres" ]]; then
+    color="\033[1;34m"
+  fi
+
+  printf '%b\n' "${color}=== Running smoke test for ${backend} backend ===${RESET}"
+}
+
+print_backend_context() {
+  local backend="${1}"
+  printf 'Source DB: %s | Restore DB: %s | backup service: %s\n' \
+    "${DB_NAME}" "${RESTORE_DB_NAME}" "${BACKUP_SERVICE_NAME}"
 }
 
 trap 'status=$?; if [[ ${status} -eq 0 ]]; then print_green "Smoke test passed."; else print_red "Smoke test failed."; fi; exit ${status}' EXIT
@@ -119,9 +148,9 @@ export_table_snapshot() {
   if [[ "${DB_TYPE}" == "mysql" ]]; then
     local sql
     if [[ -n "${order_by}" ]]; then
-      sql="SELECT * FROM \\`\${table_name}\\` ${order_by};"
+      sql=$(printf 'SELECT * FROM `%s` %s;' "${table_name}" "${order_by}")
     else
-      sql="SELECT * FROM \\`\${table_name}\\` ;"
+      sql=$(printf 'SELECT * FROM `%s`;' "${table_name}")
     fi
     run_compose exec -T "${DB_SERVICE_NAME}" mysql --batch --raw --skip-column-names -uroot -p"${DB_ROOT_PASSWORD}" "${db_name}" -e "${sql}" > "${output_file}"
   else
@@ -158,56 +187,93 @@ ensure_database_exists() {
 
   if [[ "${DB_TYPE}" == "mysql" ]]; then
     exists=$(run_compose exec -T "${DB_SERVICE_NAME}" mysql -uroot -p"${DB_ROOT_PASSWORD}" -sN -e "SHOW DATABASES LIKE '${db_name}';")
-    if [[ -z "${exists}" ]]; then
-      echo "Creating ${db_name} database..."
-      run_compose exec -T "${DB_SERVICE_NAME}" bash -lc "mysql -uroot -p${DB_ROOT_PASSWORD} -e \"CREATE DATABASE \\\`$db_name\\\`;\""
-    fi
   else
     exists=$(run_sql_query postgres "SELECT 1 FROM pg_database WHERE datname='${db_name}';")
-    if [[ "${exists}" != "1" ]]; then
-      echo "Creating ${db_name} database..."
-      run_compose exec -T "${DB_SERVICE_NAME}" psql -U postgres -d postgres -c "CREATE DATABASE \"${db_name}\";"
-    fi
   fi
+
+  if [[ -z "${exists}" ]]; then
+    if [[ "${SMOKE_TEST_BOOTSTRAP_DB}" == "1" ]]; then
+      echo "Creating ${db_name} database..."
+      if [[ "${DB_TYPE}" == "mysql" ]]; then
+        run_compose exec -T "${DB_SERVICE_NAME}" bash -lc "mysql -uroot -p${DB_ROOT_PASSWORD} -e \"CREATE DATABASE \\\`$db_name\\\`;\""
+      else
+        run_compose exec -T "${DB_SERVICE_NAME}" psql -U postgres -d postgres -c "CREATE DATABASE \"${db_name}\";"
+      fi
+      return 0
+    fi
+
+    echo "Smoke test expects the source database '${db_name}' to exist before it runs. This harness validates the plugin/library behavior, not database bootstrap." >&2
+    return 1
+  fi
+
+  return 0
 }
 
-# Intentionally avoid mutating the shared backup configuration file. The smoke test
-# uses the explicit database target passed to the backup utility and the container's
-# environment variables instead, which keeps the repo config stable while still
-# exercising the real backup/restore workflow.
+# This harness is expected to validate the actual backup/restore library paths.
+# Database creation and seed data loading are intentionally optional and should be
+# handled by the environment under test rather than by this script by default.
 ensure_sakila_data() {
+  if [[ "${SMOKE_TEST_BOOTSTRAP_DB}" != "1" ]]; then
+    return 0
+  fi
+
+  if [[ "${SMOKE_TEST_BOOTSTRAP_SAKILA}" != "1" ]]; then
+    return 0
+  fi
+
   local table_count
 
   if [[ "${DB_TYPE}" == "mysql" ]]; then
     table_count=$(run_sql_query "${DB_NAME}" "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${DB_NAME}' AND table_name='actor';")
     if [[ "${table_count}" == "0" ]]; then
-      echo "Loading Sakila schema from commit ${SAKILA_DB_COMMIT}..."
-      curl -fsSL "${SAKILA_DB_BASE_URL}/mysql-sakila-db/mysql-sakila-schema.sql" | run_compose exec -T -i "${DB_SERVICE_NAME}" mysql -uroot -p"${DB_ROOT_PASSWORD}" "${DB_NAME}"
+      echo "Optional local bootstrap enabled: loading Sakila schema..."
+      curl -fsSL "https://raw.githubusercontent.com/jOOQ/sakila/main/mysql-sakila-db/mysql-sakila-schema.sql" | run_compose exec -T -i "${DB_SERVICE_NAME}" mysql -uroot -p"${DB_ROOT_PASSWORD}" "${DB_NAME}"
 
-      echo "Loading Sakila data from commit ${SAKILA_DB_COMMIT}..."
-      curl -fsSL "${SAKILA_DB_BASE_URL}/mysql-sakila-db/mysql-sakila-insert-data.sql" | run_compose exec -T -i "${DB_SERVICE_NAME}" mysql -uroot -p"${DB_ROOT_PASSWORD}" "${DB_NAME}"
+      echo "Optional local bootstrap enabled: loading Sakila data..."
+      curl -fsSL "https://raw.githubusercontent.com/jOOQ/sakila/main/mysql-sakila-db/mysql-sakila-insert-data.sql" | run_compose exec -T -i "${DB_SERVICE_NAME}" mysql -uroot -p"${DB_ROOT_PASSWORD}" "${DB_NAME}"
     fi
   else
     table_count=$(run_sql_query "${DB_NAME}" "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='actor';")
     if [[ "${table_count}" == "0" ]]; then
-      echo "Loading Sakila schema from commit ${SAKILA_DB_COMMIT}..."
-      curl -fsSL "${SAKILA_DB_BASE_URL}/postgres-sakila-db/postgres-sakila-schema.sql" \
+      echo "Optional local bootstrap enabled: loading PostgreSQL Sakila schema..."
+      curl -fsSL "https://raw.githubusercontent.com/jOOQ/sakila/main/postgres-sakila-db/postgres-sakila-schema.sql" \
         | run_compose exec -T -i "${DB_SERVICE_NAME}" psql -U postgres -d "${DB_NAME}"
 
-      echo "Loading Sakila data from commit ${SAKILA_DB_COMMIT}..."
-      curl -fsSL "${SAKILA_DB_BASE_URL}/postgres-sakila-db/postgres-sakila-insert-data.sql" \
+      echo "Optional local bootstrap enabled: loading PostgreSQL Sakila data..."
+      curl -fsSL "https://raw.githubusercontent.com/jOOQ/sakila/main/postgres-sakila-db/postgres-sakila-insert-data.sql" \
         | run_compose exec -T -i "${DB_SERVICE_NAME}" psql -U postgres -d "${DB_NAME}"
     fi
   fi
 }
 
+write_backup_config() {
+  local config_path="/tmp/smoke-test-backup.conf"
+  local backup_spec="${DB_SERVICE_NAME}:${DB_PORT}/${DB_NAME}"
+
+  run_compose exec -T "${BACKUP_SERVICE_NAME}" bash -lc "cat > '${config_path}' <<EOF
+${backup_spec}
+EOF
+chmod 600 '${config_path}'"
+}
+
 latest_backup_file() {
-  run_compose exec -T "${BACKUP_SERVICE_NAME}" bash -lc '
-    find /backups -type f -name "*.sql.gz" \
-      -printf "%TY-%Tm-%Td %TH:%TM:%TS %p\n" \
+  local backup_prefix="${DB_SERVICE_NAME}-${DB_NAME}"
+
+  run_compose exec -T "${BACKUP_SERVICE_NAME}" bash -lc "
+    find /backups -type f -name '${backup_prefix}_*.sql.gz' \
+      -printf '%TY-%Tm-%Td %TH:%TM:%TS %p\\n' \
       | sort \
       | tail -n 1 \
-      | sed "s~^.* \(.*$\)~\1~"'
+      | sed 's~^.* \\(.*$\\)~\\1~'"
+}
+
+clear_backend_backups() {
+  local backup_prefix="${DB_SERVICE_NAME}-${DB_NAME}"
+  local active_db_pattern="*-${DB_NAME}_*.sql.gz"
+
+  echo "Clearing stale backups for ${DB_TYPE} backend before the new smoke-test backup..."
+  run_compose exec -T "${BACKUP_SERVICE_NAME}" bash -lc "
+    find /backups -type f \( -name '${backup_prefix}_*.sql.gz' -o -name '${backup_prefix}_*.sql.gz.in_progress' -o -name '${active_db_pattern}' -o -name '${DB_NAME}_*.sql.gz' -o -name '${DB_NAME}_*.sql.gz.in_progress' \) -delete"
 }
 
 restore_latest_backup() {
@@ -224,9 +290,22 @@ restore_latest_backup() {
 
   echo "Restoring ${backup_file} into ${RESTORE_DB_NAME}..."
   if [[ "${DB_TYPE}" == "mysql" ]]; then
-    run_compose exec -T "${BACKUP_SERVICE_NAME}" env CONTAINER_TYPE=mariadb SCHEDULED_RUN=1 DATABASE_SERVICE_NAME=mysql DATABASE_PASSWORD=secret DATABASE_USER=mysql /backup.sh \
+    local restore_mode_env=(
+      CONTAINER_TYPE=mariadb
+      SCHEDULED_RUN=1
+      DATABASE_SERVICE_NAME=mysql
+      DATABASE_PASSWORD="${DB_PASSWORD}"
+      DATABASE_USER="${DB_USER}"
+      MYSQL_RESTORE_PRIVILEGED_MODE="${MYSQL_RESTORE_PRIVILEGED_MODE:-0}"
+      MYSQL_RESTORE_USER="${MYSQL_RESTORE_USER:-root}"
+      MYSQL_RESTORE_PASSWORD="${MYSQL_RESTORE_PASSWORD:-${DB_ROOT_PASSWORD}}"
+    )
+
+    run_compose exec -T "${BACKUP_SERVICE_NAME}" env \
+      "${restore_mode_env[@]}" \
+      /backup.sh \
       -r "mysql:3306/${RESTORE_DB_NAME}" \
-      -a secret \
+      -a "${DB_ROOT_PASSWORD}" \
       -f "${backup_file}"
   else
     run_compose exec -T "${BACKUP_SERVICE_NAME}" env CONTAINER_TYPE=postgres SCHEDULED_RUN=1 DATABASE_SERVICE_NAME=postgresql DATABASE_PASSWORD=secret DATABASE_USER=postgres /backup.sh \
@@ -271,9 +350,9 @@ compare_database_data() {
 
     if [[ -n "${first_pk}" ]]; then
       if [[ "${DB_TYPE}" == "mysql" ]]; then
-        order_by="ORDER BY \\`\${first_pk}\\`"
+        order_by=$(printf 'ORDER BY `%s`' "${first_pk}")
       else
-        order_by="ORDER BY \"${first_pk}\""
+        order_by=$(printf 'ORDER BY "%s"' "${first_pk}")
       fi
     else
       order_by=""
@@ -298,40 +377,70 @@ compare_database_data() {
 run_backup_smoke_test() {
   local backend_result=0
 
+  clear_backend_backups
+
   echo "Running backup.sh -1..."
   if [[ "${DB_TYPE}" == "mysql" ]]; then
+    write_backup_config
     if ! run_compose exec -T "${BACKUP_SERVICE_NAME}" env \
       CONTAINER_TYPE=mariadb \
+      MYSQLDUMP_SET_GTID_PURGED=OFF \
+      MYSQLDUMP_SKIP_DEFINER=1 \
+      MYSQLDUMP_SKIP_VIEWS=1 \
+      MYSQLDUMP_SKIP_ROUTINES=1 \
+      MYSQLDUMP_SKIP_TRIGGERS=1 \
+      MYSQLDUMP_SKIP_EVENTS=1 \
       DATABASE_SERVICE_NAME=mysql \
       DATABASE_PASSWORD="${DB_PASSWORD}" \
       DATABASE_USER="${DB_USER}" \
+      MYSQL_DATABASE="${DB_NAME}" \
+      POSTGRESQL_DATABASE="${DB_NAME}" \
+      BACKUP_CONF=/tmp/smoke-test-backup.conf \
       /backup.sh -1 > /tmp/backup-container-smoke.log 2>&1; then
       backend_result=1
+      echo "MySQL backup creation failed; aborting restore/compare for this backend." >&2
     fi
   else
+    write_backup_config
     if ! run_compose exec -T "${BACKUP_SERVICE_NAME}" env \
       CONTAINER_TYPE=postgres \
       DATABASE_SERVICE_NAME=postgresql \
       DATABASE_PASSWORD="${DB_PASSWORD}" \
       DATABASE_USER="${DB_USER}" \
+      POSTGRESQL_DATABASE="${DB_NAME}" \
+      MYSQL_DATABASE="${DB_NAME}" \
+      BACKUP_CONF=/tmp/smoke-test-backup.conf \
       /backup.sh -1 > /tmp/backup-container-smoke.log 2>&1; then
       backend_result=1
     fi
   fi
 
   if (( backend_result == 0 )); then
-    echo "Latest backup files:"
-    run_compose exec -T "${BACKUP_SERVICE_NAME}" bash -lc '
-      find /backups -type f -name "*.sql.gz" \
-        -printf "%TY-%Tm-%Td %TH:%TM:%TS %p\n" \
+    echo "Latest backup files for ${DB_TYPE}/${DB_NAME}:"
+    run_compose exec -T "${BACKUP_SERVICE_NAME}" bash -lc "
+      find /backups -type f -name '${DB_SERVICE_NAME}-${DB_NAME}_*.sql.gz' \
+        -printf '%TY-%Tm-%Td %TH:%TM:%TS %p\n' \
         | sort \
-        | tail -n 5'
+        | tail -n 5"
 
     if ! restore_latest_backup; then
       backend_result=1
+      echo "Restore failed for ${DB_TYPE}; stopping before comparison." >&2
     elif ! compare_database_data; then
       backend_result=1
+      echo "Data comparison failed for ${DB_TYPE}; restore did not match source data." >&2
     fi
+  fi
+
+  # Some MySQL/MariaDB restore failures do not exit non-zero even though the SQL
+  # stream contains an actual SQL error. Keep the final backend result honest and
+  # avoid a false-positive PASS when a restore fails in the middle of the dump
+  # stream. Match only SQL error lines that start with the real MySQL error
+  # prefix; do not treat backup warnings such as `mysqldump: Error:` as a restore
+  # failure.
+  if (( backend_result == 0 )) && [[ "${DB_TYPE}" == "mysql" ]] && [[ -f "/tmp/backup-container-smoke.log" ]] && grep -Eq '^[[:space:]]*ERROR [0-9]{3} ' /tmp/backup-container-smoke.log; then
+    backend_result=1
+    echo "Detected a restore-related error in the MySQL smoke-test log; marking backend as failed." >&2
   fi
 
   if (( backend_result == 0 )); then
@@ -343,6 +452,13 @@ run_backup_smoke_test() {
   fi
 
   return ${backend_result}
+}
+
+mark_backend_failed() {
+  local backend="${1}"
+  local reason="${2}"
+  BACKEND_RESULTS["${backend}"]="FAIL"
+  BACKEND_DETAILS["${backend}"]="${reason}"
 }
 
 print_test_summary() {
@@ -395,24 +511,22 @@ main() {
       exit 1
     fi
 
-    echo "=== Running smoke test for ${DB_TYPE} backend ==="
+    print_backend_banner "${DB_TYPE}"
+    print_backend_context "${DB_TYPE}"
     if ! wait_for_database; then
-      BACKEND_RESULTS["${DB_TYPE}"]="FAIL"
-      BACKEND_DETAILS["${DB_TYPE}"]="Database service never became ready."
+      mark_backend_failed "${DB_TYPE}" "Database service never became ready."
       overall_exit=1
       continue
     fi
 
     if ! ensure_database_exists "${DB_NAME}"; then
-      BACKEND_RESULTS["${DB_TYPE}"]="FAIL"
-      BACKEND_DETAILS["${DB_TYPE}"]="Source database could not be created."
+      mark_backend_failed "${DB_TYPE}" "Source database is not available for the smoke test. Create or prepare it outside the harness, or enable SMOKE_TEST_BOOTSTRAP_DB=1 for a local convenience bootstrap."
       overall_exit=1
       continue
     fi
 
     if ! ensure_sakila_data; then
-      BACKEND_RESULTS["${DB_TYPE}"]="FAIL"
-      BACKEND_DETAILS["${DB_TYPE}"]="Sakila sample data could not be loaded."
+      mark_backend_failed "${DB_TYPE}" "Optional bootstrap data could not be loaded."
       overall_exit=1
       continue
     fi

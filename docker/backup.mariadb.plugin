@@ -28,8 +28,100 @@ function onBackupDatabase(){
     _password=$(getPassword ${_databaseSpec})
     echoGreen "Backing up '${_hostname}${_port:+:${_port}}${_database:+/${_database}}' to '${_backupFile}' ..."
 
-    MYSQL_PWD=${_password} mysqldump -h "${_hostname}" -u "${_username}" ${_portArg} "${_database}" | gzip > ${_backupFile}
-    return ${?}
+    # Default behavior stays unchanged for regular MySQL/MariaDB users. Some
+    # dumps include GTID/DEFINER metadata or object definitions that require
+    # elevated privileges during restore. Callers can explicitly opt into a more
+    # portable data-only dump with MYSQLDUMP_SET_GTID_PURGED=OFF,
+    # MYSQLDUMP_SKIP_DEFINER=1, and related skip flags.
+    #
+    # The project keeps a separate privileged path for full-object restores (for
+    # example views, routines, triggers, or events). The default data-only flow
+    # intentionally excludes those objects unless the caller explicitly requests a
+    # privileged restore. This avoids silently changing standard behavior while
+    # still allowing constrained validation harnesses to verify data integrity.
+    #
+    # MySQL's mysqldump does not support --skip-views in this image, so the
+    # data-only path removes view definitions after the dump is generated.
+    local _mysqldump_args=()
+    if [[ "${MYSQLDUMP_SET_GTID_PURGED:-}" == "OFF" ]]; then
+      _mysqldump_args+=(--set-gtid-purged=OFF)
+    fi
+    if [[ "${MYSQLDUMP_SKIP_ROUTINES:-}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+      _mysqldump_args+=(--skip-routines)
+    fi
+    if [[ "${MYSQLDUMP_SKIP_TRIGGERS:-}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+      _mysqldump_args+=(--skip-triggers)
+    fi
+    if [[ "${MYSQLDUMP_SKIP_EVENTS:-}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+      _mysqldump_args+=(--skip-events)
+    fi
+
+    local _dump_temp_file="${_backupFile}.tmp"
+    local _dump_filter=0
+    if [[ "${MYSQLDUMP_SKIP_VIEWS:-}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+      _dump_filter=1
+    fi
+    if [[ "${MYSQLDUMP_SKIP_DEFINER:-}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+      _dump_filter=1
+    fi
+
+    MYSQL_PWD=${_password} mysqldump -h "${_hostname}" -u "${_username}" ${_portArg} "${_mysqldump_args[@]}" "${_database}" > "${_dump_temp_file}"
+    _rtnCd=${?}
+
+    if (( _rtnCd == 0 )) && (( _dump_filter == 1 )); then
+      python3 - "${_dump_temp_file}" "${_backupFile}.filtered" <<'PY'
+import re, sys
+src = sys.argv[1]
+out = sys.argv[2]
+with open(src, 'r', encoding='utf-8', errors='ignore') as fh:
+    lines = fh.readlines()
+filtered = []
+idx = 0
+while idx < len(lines):
+    line = lines[idx]
+    stripped = line.strip()
+    if stripped.startswith('-- Temporary view structure for view') or stripped.startswith('-- Final view structure for view'):
+        idx += 1
+        continue
+    if re.match(r'^/\*!50001 (DROP VIEW IF EXISTS|CREATE VIEW|CREATE ALGORITHM=|VIEW )', stripped):
+        if ';' in line:
+            idx += 1
+            continue
+        idx += 1
+        while idx < len(lines):
+            if ';' in lines[idx]:
+                idx += 1
+                break
+            idx += 1
+        continue
+    if re.match(r'^DROP TABLE IF EXISTS `.*`;$', stripped) and 'VIEW' in line.upper():
+        idx += 1
+        continue
+    if re.match(r'^CREATE ALGORITHM=.* VIEW ', stripped, re.IGNORECASE):
+        idx += 1
+        while idx < len(lines):
+            if ';' in lines[idx]:
+                idx += 1
+                break
+            idx += 1
+        continue
+    line = re.sub(r'/\*!50013 DEFINER=`[^`]+`@`[^`]+` SQL SECURITY (DEFINER|INVOKER) \*/', r'/*!50013 */', line)
+    line = re.sub(r'/\*!50003 CREATE\*/ /\*!50017 DEFINER=`[^`]+`@`[^`]+`\*/', r'/*!50003 CREATE*/', line)
+    line = re.sub(r'DEFINER=`[^`]+`@`[^`]+` ', '', line)
+    line = re.sub(r' SQL SECURITY (DEFINER|INVOKER)', '', line)
+    filtered.append(line)
+    idx += 1
+with open(out, 'w', encoding='utf-8', errors='ignore') as fh:
+    fh.write(''.join(filtered))
+PY
+      gzip -c "${_backupFile}.filtered" > "${_backupFile}"
+      rm -f "${_backupFile}.filtered"
+    elif (( _rtnCd == 0 )); then
+      gzip -c "${_dump_temp_file}" > "${_backupFile}"
+    fi
+
+    rm -f "${_dump_temp_file}"
+    return ${_rtnCd}
   )
 }
 
@@ -56,12 +148,58 @@ function onRestoreDatabase(){
     _password=$(getPassword ${_databaseSpec})
     echo -e "Restoring '${_fileName}' to '${_hostname}${_port:+:${_port}}${_database:+/${_database}}' ...\n" >&2
 
-    
-    # Restore
-    gunzip -c "${_fileName}" | MYSQL_PWD=${_password} mysql -h ${_hostname} -u ${_username} ${_portArg} ${_database}
-    _rtnCd=${PIPESTATUS[1]}
+    # Default behavior stays unchanged for regular MySQL/MariaDB users. Some
+    # dumps include routines, triggers, or events that require server-level
+    # privileges or log_bin_trust_function_creators during restore. Lower-
+    # privilege users often cannot satisfy that requirement, even when the dump
+    # itself is valid.
+    #
+    # This restore path treats the default mode as a data-focused validation flow.
+    # It does not silently reconnect as root or enable server settings for normal
+    # users. To validate a full-object restore, callers must explicitly opt in
+    # with MYSQL_RESTORE_PRIVILEGED_MODE=1, which uses a dedicated restore user
+    # and enables the compatibility setting only for that operation.
+    local _restore_user="${_username}"
+    local _restore_password="${_password}"
+    if [[ "${MYSQL_RESTORE_PRIVILEGED_MODE:-}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+      _restore_user="${MYSQL_RESTORE_USER:-root}"
+      _restore_password="${MYSQL_RESTORE_PASSWORD:-${MYSQL_ROOT_PASSWORD:-${_password}}}"
+      if ! MYSQL_PWD="${_restore_password}" mysql -h "${_hostname}" -u "${_restore_user}" ${_portArg} -e "SET GLOBAL log_bin_trust_function_creators = 1;" >/dev/null 2>&1; then
+        echoRed "Privileged MySQL restore mode enabled, but the configured restore user could not set log_bin_trust_function_creators=1 for this server." >&2
+        return 1
+      fi
+    fi
 
-    return ${_rtnCd} 
+    # Drop and recreate the target database before loading the dump so a stale
+    # restore target cannot keep old objects around from a previous run. This is
+    # the MySQL equivalent of the PostgreSQL plugin's drop-then-create flow and
+    # keeps validation repeatable.
+    if ! MYSQL_PWD="${_restore_password}" mysql -h "${_hostname}" -u "${_restore_user}" ${_portArg} -e "DROP DATABASE IF EXISTS \`$_database\`; CREATE DATABASE \`$_database\`;" >/dev/null 2>&1; then
+      echoRed "Unable to reset the target MySQL database '${_database}' before restore." >&2
+      return 1
+    fi
+
+    # Keep status honest: the mysql CLI can exit 0 even when the SQL stream
+    # contains an ERROR line. Treat that as a failed restore so we do not report a
+    # false-positive PASS for a dump that did not actually restore cleanly.
+    #
+    # Process substitution keeps the mysql exit code authoritative while still
+    # capturing the full SQL error stream for inspection.
+    set -o pipefail
+    local _restore_output
+    local _rtnCd=0
+    _restore_output=$(MYSQL_PWD="${_restore_password}" mysql -h "${_hostname}" -u "${_restore_user}" ${_portArg} "${_database}" 2>&1 < <(gunzip -c "${_fileName}"))
+    _rtnCd=$?
+
+    if (( _rtnCd == 0 )) && printf '%s\n' "${_restore_output}" | grep -Eq '(^|[[:space:]])ERROR [0-9]{3} '; then
+      _rtnCd=1
+    fi
+
+    if [[ -n "${_restore_output}" ]]; then
+      printf '%s\n' "${_restore_output}" >&2
+    fi
+
+    return ${_rtnCd}
   )
 }
 
@@ -210,7 +348,7 @@ function onGetDbSize(){
     _password=$(getPassword ${_databaseSpec})
 
     MYSQL_PWD=${_password} mysql -h "${_hostname}" -u "${_username}" ${_portArg} "${_database}" -e "SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 1) AS \"size in mb\" FROM information_schema.tables WHERE table_schema=\"${_database}\" GROUP BY table_schema;"
-    
+
     echo ${size}
     return ${rtnCd}
   )

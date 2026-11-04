@@ -23,6 +23,8 @@ function startLegacy(){
 }
 
 function shutDown(){
+  local exitCode=$?
+
   jobIds=$(jobs | awk -F '[][]' '{print $2}' )
   for jobId in ${jobIds} ; do
     echo "Shutting down background job '${jobId}' ..."
@@ -34,6 +36,6 @@ function shutDown(){
   fi
   wait
 
-  exit 0
+  exit ${exitCode}
 }
 # ======================================================================================

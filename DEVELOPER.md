@@ -43,19 +43,28 @@ ls docker/ | grep 'backup\.' | awk '{ print "- ./docker/"$1":/"$1 }'
 
 ## Smoke test
 
-The project includes a smoke test that validates a real backup/restore flow against the configured database backends.
+The project includes a smoke test that validates the real backup/restore behavior of the configured database plugins and the shared backup library itself.
 
 What it does:
 
-1. Ensures the source database exists for the selected backend.
-2. Loads a Sakila schema/data set if it is not already present.
-3. Runs the backup command to produce a `.sql.gz` archive.
-4. Locates the newest backup.
-5. Restores that backup into a second database (`sakila_restore`).
-6. Exports each table from both databases to a stable, ordered snapshot.
-7. Compares the snapshot and exits non-zero on any mismatch.
+1. Verifies that the source database already exists for the selected backend.
+2. Runs the backup command to produce a `.sql.gz` archive.
+3. Locates the newest backup for that database/backend.
+4. Restores that backup into a second database (`sakila_restore` by default).
+5. Exports each table from both databases to a stable, ordered snapshot.
+6. Compares the snapshot and exits non-zero on any mismatch.
 
 This is the working validation strategy for the smoke test: compare the actual table data from the source and restored databases rather than comparing raw dump output, which may include engine-specific metadata and can differ even when the underlying data matches.
+
+The smoke test is intentionally not a self-contained database bootstrapper. It validates the plugin/library path against a real source database that already exists in the environment under test. That keeps the smoke test focused on the functionality we actually want to verify: backup, restore, and data integrity behavior.
+
+For a local convenience bootstrap, you may opt in to creating and seeding a sample database with:
+
+```bash
+SMOKE_TEST_BOOTSTRAP_DB=1 SMOKE_TEST_BOOTSTRAP_SAKILA=1 bash scripts/smoke-test.sh
+```
+
+That is optional; the default path expects the database and its application data to be prepared outside of the smoke test itself.
 
 Run the smoke test after the stack is up:
 
@@ -70,6 +79,12 @@ The default matrix is both PostgreSQL and MySQL in a single run. You can limit i
 DB_TYPES=postgres bash scripts/smoke-test.sh
 DB_TYPES=mysql bash scripts/smoke-test.sh
 ```
+
+The restore step explicitly sets `CONTAINER_TYPE` for the active backend (`postgres` or `mariadb`) before invoking the shared backup utility. This is intentional and prevents the generic restore path from falling back to the default auto-detected container type, which could otherwise pick the wrong plugin and attempt to connect to the wrong database service during a MySQL restore. The smoke test therefore exercises the real shared backup script without mutating repo config files.
+
+For MySQL/MariaDB backups, the default smoke-test path is intentionally data-only: it disables GTID purge metadata (`--set-gtid-purged=OFF`), strips DEFINER metadata, and skips routines/triggers/events unless an explicit full-object flow is requested. This keeps the normal plugin behavior focused on data validation without changing the default production behavior for users who do not need privileged object restores.
+
+If you intentionally need to validate a full-object dump that includes routines, triggers, or event definitions, opt into the explicit privileged restore path by setting `MYSQL_RESTORE_PRIVILEGED_MODE=1` and, if needed, `MYSQL_RESTORE_USER`/`MYSQL_RESTORE_PASSWORD` for a restore account that can set `log_bin_trust_function_creators = 1` on the target server. This is a deliberate compatibility mode for constrained or smoke-test restore environments, not the default behavior.
 
 The script prints progress as it creates the database, loads Sakila data, runs the backup, restores the archive, and compares the table contents. If all backends pass, the final output includes a per-backend status line and:
 
