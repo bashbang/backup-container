@@ -35,7 +35,7 @@ RUN echo $TZ > /etc/timezone
 # ========================================================================================================
 
 # The column command is missing from quay.io/fedora/postgresql-14:14
-RUN dnf install -y util-linux
+RUN dnf install -y util-linux mysql
 
 # Important - Reset to the base image's user account.
 USER 26

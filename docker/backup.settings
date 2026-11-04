@@ -48,7 +48,12 @@ export MONGO_DB="mongo"
 export POSTGRE_DB="postgres"
 export MSSQL_DB="mssql"
 export MARIA_DB="mariadb"
-export CONTAINER_TYPE="$(getContainerType)"
+
+# Respect an explicit backend override from the caller before falling back to
+# automatic detection. This keeps scripted restore calls deterministic and avoids
+# accidentally loading the wrong database plugin when a caller explicitly targets
+# postgres or mariadb.
+export CONTAINER_TYPE="${CONTAINER_TYPE:-$(getContainerType)}"
 
 # Other:
 export DATABASE_SERVER_TIMEOUT=${DATABASE_SERVER_TIMEOUT:-120}

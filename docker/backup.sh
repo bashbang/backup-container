@@ -21,11 +21,16 @@
 # --------------------------------------------------------------------------------------
 trap shutDown EXIT TERM
 
-# Load database plug-in based on the container type ...
+# Load a database plug-in based on the explicitly selected container type when
+# one was provided. If no explicit override exists, fall back to the detected
+# container type. This avoid mismatches where the generic restore path silently
+# chooses the wrong backend plugin for a targeted restore.
+export CONTAINER_TYPE="${CONTAINER_TYPE:-${CONTAINER_TYPE:-$(getContainerType)}}"
+
 . ./backup.${CONTAINER_TYPE}.plugin > /dev/null 2>&1
 if [[ ${?} != 0 ]]; then
   echoRed "backup.${CONTAINER_TYPE}.plugin not found."
-  
+
   # Default to null plugin.
   export CONTAINER_TYPE=${UNKNOWN_DB}
   . ./backup.${CONTAINER_TYPE}.plugin > /dev/null 2>&1
@@ -109,15 +114,18 @@ case $(getMode) in
 
     if validateOperation "${_restoreDatabase}" "${RESTORE}"; then
       restoreDatabase ${restoreFlags} "${_restoreDatabase}" "${_fromBackup}"
+      exit ${?}
     fi
     ;;
 
   ${VERIFY})
     verifyBackups "${_verifyBackup}" "${_fromBackup}"
+    exit ${?}
     ;;
 
   ${SCHEDULED_VERIFY})
     verifyBackups -q "${_verifyBackup}" "${_fromBackup}"
+    exit ${?}
     ;;
 
   ${CRON})
